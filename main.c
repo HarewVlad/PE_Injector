@@ -4,10 +4,13 @@
 #include <string.h>
 #include <stdlib.h>
 
-#define MAXBUFFSIZE 8192
+#define MAX_BUFF 256
 #define DWORD 4
 #define WORD 2
 #define BYTE 1
+
+#define SECTION_ALIGN 0x1000
+#define FILE_ALIGN 0x200
 
 #define BYTE_TYPE(x)			__asm _emit x 
 #define WORD_TYPE(x)			BYTE_TYPE((x>>(0*8))&0xFF)	BYTE_TYPE((x>>(1*8))&0xFF)
@@ -16,6 +19,7 @@
 #define BEGIN 0x223344
 #define DATA 0x102132
 #define END 0x556677
+
 
 // unsigned int littleToBig(const unsigned char source[], int size)
 // {
@@ -62,9 +66,9 @@ void SaveRead(void *dst, size_t sizeOfDst, int numToRead, FILE *f)
 	}
 }
 
-void SaveWrite(void *dst, size_t sizeOfDst, int numToRead, FILE *f)
+void SaveWrite(void *dst, size_t sizeOfDst, int numToWrite, FILE *f)
 {
-	if (!fwrite(dst, sizeOfDst, numToRead, f))
+	if (!fwrite(dst, sizeOfDst, numToWrite, f))
 	{
 		perror("Goddamn");
 	}
@@ -125,6 +129,177 @@ void jmpToOEP()
 	}
 }
 
+unsigned int PEAlign(unsigned int from, unsigned int to)
+{	
+	return (((from + to - 1) / to) * to);
+}
+
+struct IMAGE_SECTION_HEADER
+{
+	unsigned char Name1[8];
+	unsigned int virtualSize;
+	unsigned int virtualAddress;
+	unsigned int sizeOfRawData;
+	unsigned int pointerToRawData;
+	unsigned int pointerToRelocations;
+	unsigned int pointerToLinenumbers;
+	unsigned short numberOfRelocations;
+	unsigned short numberOfLineNumbers;
+	unsigned int characteristic;
+} ish[64];
+
+struct PEstuff
+{
+	unsigned int PEoffset;
+	unsigned int PEOH;
+	unsigned int PEST;
+
+	unsigned int imageBase;
+	unsigned int OEP;
+
+	unsigned short numberOfSections;
+	unsigned int sizeOfImage;
+
+	struct IMAGE_SECTION_HEADER *p_ish;
+};
+
+void fillPEstuff(struct PEstuff *pes, FILE *f)
+{
+	// PE OFFSET //
+	fseek(f, 0x3C, SEEK_SET);
+	SaveRead(&pes->PEoffset, sizeof(unsigned int), 1, f);
+
+	// PE Optional Header //
+	pes->PEOH = pes->PEoffset + 0x18;
+
+	// PE Section Table //
+	pes->PEST = pes->PEoffset + 0x0F8;
+
+	// Image base //
+	fseek(f, pes->PEoffset + 0x34, SEEK_SET);
+	SaveRead(&pes->imageBase, sizeof(unsigned int), 1, f);
+
+	// Original entry point //
+	fseek(f, pes->PEoffset + 0x28, SEEK_SET);
+	SaveRead(&pes->OEP, sizeof(unsigned int), 1, f);
+
+	// Number of sectionss //
+	fseek(f, pes->PEoffset + 6, SEEK_SET);
+	SaveRead(&pes->numberOfSections, sizeof(unsigned short), 1, f);
+
+	// SizeOfImage //
+	fseek(f, pes->PEoffset + 0x50, SEEK_SET);
+	SaveRead(&pes->sizeOfImage, sizeof(unsigned int), 1, f);
+
+	int offset = 0x0F8;
+	for (int i = 0; i < pes->numberOfSections; i++)
+	{
+		fseek(f, pes->PEoffset + offset, SEEK_SET);
+		SaveRead(&pes->p_ish[i], sizeof(struct IMAGE_SECTION_HEADER), 1, f);
+		offset += 0x28;
+	}
+}
+
+void printSections(struct PEstuff *pes, int i)
+{
+	printf("Name1 -> %s\n", pes->p_ish[i].Name1);
+	printf("Virtual size -> %x\n", pes->p_ish[i].virtualSize);
+	printf("Virtual address -> %x\n", pes->p_ish[i].virtualAddress);
+	printf("Size of raw data -> %x\n", pes->p_ish[i].sizeOfRawData);
+	printf("Pointer to raw data -> %x\n", pes->p_ish[i].pointerToRawData);
+	printf("Characteristic -> %x\n", pes->p_ish[i].characteristic);
+}
+
+void alignSections(struct PEstuff *pes, FILE *f)
+{
+	for (int i = 0; i < pes->numberOfSections; i++)
+	{
+		// printf("Section %d -> \n", i);
+		pes->p_ish[i].virtualSize = PEAlign(pes->p_ish[i].virtualSize, SECTION_ALIGN);
+		pes->p_ish[i].virtualAddress = PEAlign(pes->p_ish[i].virtualAddress, SECTION_ALIGN);
+		pes->p_ish[i].sizeOfRawData = PEAlign(pes->p_ish[i].sizeOfRawData, FILE_ALIGN);
+		pes->p_ish[i].pointerToRawData = PEAlign(pes->p_ish[i].pointerToRawData, FILE_ALIGN);
+		// printSections(pes, i);
+	}
+	// Write //
+	int offset = 0x0F8;
+	for (int i = 0; i < pes->numberOfSections; i++)
+	{
+		fseek(f, pes->PEoffset + offset, SEEK_SET);
+		SaveWrite(&pes->p_ish[i], sizeof(struct IMAGE_SECTION_HEADER), 1, f);
+		offset += 0x28;
+	}
+
+	// Change sizeOfImage //
+	fseek(f, pes->PEoffset + 0x50, SEEK_SET);
+	pes->sizeOfImage = pes->p_ish[pes->numberOfSections - 1].virtualAddress
+	 + pes->p_ish[pes->numberOfSections - 1].virtualSize;
+	SaveWrite(&pes->sizeOfImage, sizeof(unsigned int), 1, f);
+}
+
+void createNewSection(struct PEstuff *pes, FILE *f, unsigned int size)
+{
+	// Fill new section //
+	unsigned char temp_Name1[8] = ".NEW";
+	memcpy(pes->p_ish[pes->numberOfSections].Name1, temp_Name1, sizeof(temp_Name1));
+	pes->p_ish[pes->numberOfSections].virtualAddress = PEAlign(pes->p_ish[pes->numberOfSections - 1].virtualAddress
+		+ pes->p_ish[pes->numberOfSections - 1].virtualSize, SECTION_ALIGN);
+	pes->p_ish[pes->numberOfSections].virtualSize = PEAlign(size, SECTION_ALIGN);
+	pes->p_ish[pes->numberOfSections].sizeOfRawData = PEAlign(size, FILE_ALIGN);
+	pes->p_ish[pes->numberOfSections].pointerToRawData = PEAlign(pes->p_ish[pes->numberOfSections - 1].pointerToRawData
+		+ pes->p_ish[pes->numberOfSections - 1].sizeOfRawData, FILE_ALIGN);
+	pes->p_ish[pes->numberOfSections].characteristic = 0xE0000040;
+
+	// Write new section //
+	int offset = 0x0F8 + pes->numberOfSections * 0x28;
+	fseek(f, pes->PEoffset + offset, SEEK_SET);
+	SaveWrite(&pes->p_ish[pes->numberOfSections], sizeof(struct IMAGE_SECTION_HEADER), 1, f);
+
+	// Enlarge the file //
+	fseek(f, 0, SEEK_END);
+	unsigned int numToWrite = pes->p_ish[pes->numberOfSections].virtualSize;
+	unsigned char *byte = malloc(numToWrite);
+	SaveWrite(byte, sizeof(unsigned char), numToWrite, f);
+
+	free(byte);
+
+	// Change numberOfSections ++ //
+	fseek(f, pes->PEoffset + 6, SEEK_SET);
+	pes->numberOfSections++;
+	SaveWrite(&pes->numberOfSections, sizeof(unsigned short), 1, f);
+}
+
+void injectCode(struct PEstuff *pes, FILE *f)
+{
+	unsigned int begin_jmpOEP = getPosOfCode((unsigned int)jmpToOEP, BEGIN) + 4;
+	unsigned int data_jmpOEP = getPosOfCode((unsigned int)jmpToOEP, DATA) + 4;
+	unsigned int end_jmpOEP = getPosOfCode((unsigned int)jmpToOEP, END);
+	unsigned int sizeCode_jmpOEP = data_jmpOEP - begin_jmpOEP;
+	unsigned int sizeData_jmpOEP = end_jmpOEP - data_jmpOEP;
+
+	// printf("begin_jmpOEP -> %x\n", begin_jmpOEP);
+	// printf("end_jmpOEP -> %x\n", end_jmpOEP);
+	// printf("sizeCode_jmpOEP -> %x\n", sizeCode_jmpOEP);
+	// printf("sizeData_jmpOEP -> %x\n", sizeData_jmpOEP);
+
+	unsigned char *buff_jmpOEP = malloc(sizeCode_jmpOEP + sizeData_jmpOEP + 1);
+	memset((void *)buff_jmpOEP, 0, sizeCode_jmpOEP + sizeData_jmpOEP + 1);
+	memcpy((void *)buff_jmpOEP, (void *)begin_jmpOEP, sizeCode_jmpOEP);
+	memcpy(&buff_jmpOEP[sizeCode_jmpOEP], (void *)data_jmpOEP, sizeData_jmpOEP);
+
+	// Fill the data //
+	unsigned int OEP_imageBase = pes->OEP + pes->imageBase;
+	memcpy(&buff_jmpOEP[sizeCode_jmpOEP], &OEP_imageBase, sizeData_jmpOEP);
+
+	// Inject //
+	fseek(f, pes->p_ish[pes->numberOfSections - 1].pointerToRawData, SEEK_SET);
+	SaveWrite(buff_jmpOEP, sizeof(unsigned char), sizeCode_jmpOEP + sizeData_jmpOEP, f);
+
+	// Change OEP //
+	fseek(f, pes->PEoffset + 0x28, SEEK_SET);
+	SaveWrite(&pes->p_ish[pes->numberOfSections - 1].virtualAddress, sizeof(unsigned int), 1, f);
+}
+
 int main()
 {
 	FILE *f = fopen("test.exe", "r+");
@@ -134,135 +309,11 @@ int main()
 		printf("Goddamn\n");
 	}
 
-	// PE OFFSET //
-	unsigned int PEoffset = 0;
-	fseek(f, 0x3C, SEEK_SET);
-	SaveRead(&PEoffset, sizeof(unsigned int), 1, f);
-	printf("RVA of PE header -> %x\n", PEoffset);
+	struct PEstuff *pes = malloc(sizeof(struct PEstuff));
+	pes->p_ish = &ish[0];
 
-	// PE Optional Header //
-	unsigned int PEOH = PEoffset + 0x18;
-
-	// PE Section Table //
-	unsigned int PEST = PEoffset + 0x0F8;
-
-	// Name of Code section //
-	unsigned char Name1_code[8 + 1];
-	fseek(f, PEST, SEEK_SET);
-	SaveRead(&Name1_code, sizeof(char), sizeof(Name1_code), f);
-
-	// Pointer to raw data of code section //
-	unsigned int p_RawData_code = 0;
-	fseek(f, PEST + 0x14, SEEK_SET);
-	SaveRead(&p_RawData_code, sizeof(unsigned int), 1, f);
-	printf("PointerToRawData of %s section -> %x\n", Name1_code, p_RawData_code);
-
-	// Size of raw data of code section //
-	unsigned int sizeOfRawData_code = 0;
-	fseek(f, PEoffset + 0x1C, SEEK_SET);
-	SaveRead(&sizeOfRawData_code, sizeof(unsigned int), 1, f);
-	printf("Size of code of %s section-> %x\n", Name1_code, sizeOfRawData_code);
-
-	// Virtual size of code section //
-	unsigned int virtualSize_code = 0;
-	fseek(f, PEST + 0x8, SEEK_SET);
-	SaveRead(&virtualSize_code, sizeof(unsigned int), 1, f);
-	printf("Virtual size of %s section -> %x\n", Name1_code, virtualSize_code);
-
-	printf("Free space in %s section -> %x\n", Name1_code, (sizeOfRawData_code - virtualSize_code));
-
-	// Name of data section //
-	unsigned char Name1_data[8 + 1];
-	fseek(f, PEST + 0x28, SEEK_SET);
-	SaveRead(&Name1_data, sizeof(char), sizeof(Name1_data), f);
-
-	// Pointer to raw data of data section //
-	unsigned int p_RawData_data = 0;
-	fseek(f, PEST + 0x28 + 0x14, SEEK_SET);
-	SaveRead(&p_RawData_data, sizeof(unsigned int), 1, f);
-	printf("PointerToRawData of %s section -> %x\n", Name1_data, p_RawData_data);
-
-	// Image base //
-	unsigned int imageBase = 0;
-	fseek(f, PEoffset + 0x34, SEEK_SET);
-	SaveRead(&imageBase, sizeof(unsigned int), 1, f);
-	printf("Image base -> %x\n", imageBase);
-
-	// Pointer to free block of memory insize code section //
-	unsigned int p_FreeBlock = p_RawData_data - (sizeOfRawData_code - virtualSize_code);
-	printf("Beginning of a free block -> %x\n", p_FreeBlock);
-
-	// Original entry point //
-	unsigned int OEP = 0;
-	fseek(f, PEoffset + 0x28, SEEK_SET);
-	SaveRead(&OEP, sizeof(unsigned int), 1, f);
-	printf("OEP -> %x\n", OEP);
-
-	// Original entry point + image base //
-	unsigned int OEP_imageBase = OEP + imageBase;
-	printf("OEP_imageBase -> %x\n", OEP_imageBase);
-
-	// Modified original entry point //
-	unsigned int mod_OEP = p_FreeBlock - p_RawData_code + 0x1000;
-	fseek(f, PEoffset + 0x28, SEEK_SET);
-	SaveWrite(&mod_OEP, sizeof(unsigned int), 1, f);
-	printf("Mod. OEP -> %x\n", mod_OEP);
-
-	// Modified original entry point + image base //
-	unsigned int mod_OEP_imageBase = mod_OEP + imageBase;
-	printf("Mod. OEP_imageBase -> %x\n", mod_OEP_imageBase);
-
-	// Inject code to PE file //
-	// unsigned int begin_jmpOEP = getPosOfCode((unsigned int)jmpToOEP, BEGIN) + 4;
-	// unsigned int end_jmpOEP = getPosOfCode((unsigned int)jmpToOEP, END);
-	// unsigned int size_jmpOEP = end_jmpOEP - begin_jmpOEP;
-
-	// unsigned char *buff_jmpOEP = malloc(size_jmpOEP + 1);
-	// memset(buff_jmpOEP, 0, size_jmpOEP + 1);
-	// memcpy(buff_jmpOEP, begin_jmpOEP, size_jmpOEP);
-
-	// unsigned int data_jmpOEP = getPosOfCode((unsigned int)&buff_jmpOEP, DATA) + 4;
-	// printf("data_jmpOEP -> %x\n", data_jmpOEP);
-	// memcpy((void *)data_jmpOEP, (void *)OEP_imageBase, sizeof(unsigned int));
-
-
-	// fseek(f, p_FreeBlock, SEEK_SET);
-	// SaveWrite((void *)begin_jmpOEP, sizeof(unsigned char), size_jmpOEP, f);
-
-	// Get code //
-	unsigned int begin_jmpOEP = getPosOfCode((unsigned int)jmpToOEP, BEGIN) + 4;
-	unsigned int data_jmpOEP = getPosOfCode((unsigned int)jmpToOEP, DATA) + 4;
-	unsigned int end_jmpOEP = getPosOfCode((unsigned int)jmpToOEP, END);
-	unsigned int sizeCode_jmpOEP = data_jmpOEP - begin_jmpOEP;
-	unsigned int sizeData_jmpOEP = end_jmpOEP - data_jmpOEP;
-
-	printf("begin_jmpOEP -> %x\n", begin_jmpOEP);
-	printf("end_jmpOEP -> %x\n", end_jmpOEP);
-	printf("sizeCode_jmpOEP -> %x\n", sizeCode_jmpOEP);
-	printf("sizeData_jmpOEP -> %x\n", sizeData_jmpOEP);
-
-	unsigned char *buff_jmpOEP = malloc(sizeCode_jmpOEP + sizeData_jmpOEP + 1);
-	memset((void *)buff_jmpOEP, 0, sizeCode_jmpOEP + sizeData_jmpOEP + 1);
-	memcpy((void *)buff_jmpOEP, (void *)begin_jmpOEP, sizeCode_jmpOEP);
-	memcpy(&buff_jmpOEP[sizeCode_jmpOEP], (void *)data_jmpOEP, sizeData_jmpOEP);
-
-	// Fill the data //
-	memcpy(&buff_jmpOEP[sizeCode_jmpOEP], (void *)&OEP_imageBase, sizeData_jmpOEP);
-
-	// Inject //
-	fseek(f, p_FreeBlock, SEEK_SET);
-	SaveWrite((void *)buff_jmpOEP, sizeof(unsigned char), sizeCode_jmpOEP + sizeData_jmpOEP, f);
-
-	// Change virtual size of code //
-	unsigned int mod_VirtualSize_code = virtualSize_code + sizeCode_jmpOEP + sizeData_jmpOEP;
-	fseek(f, PEST + 0x8, SEEK_SET);
-	SaveWrite(&mod_VirtualSize_code, sizeof(unsigned int), 1, f);
-
-	// Trying to call already imported function //
-	unsigned int IAT = PEoffset + 0x80;
-	printf("IAT -> %x\n", IAT);
-	unsigned int orig_FirstChank = 0;
-	fseek(f, IAT, SEEK_SET);
-	SaveRead(&orig_FirstChank, sizeof(unsigned int), 1, f);
-	printf("orig_FirstChank -> %x\n", orig_FirstChank);
+	fillPEstuff(pes, f);
+	createNewSection(pes, f, 0x2000);
+	alignSections(pes, f);
+	injectCode(pes, f);
 }
